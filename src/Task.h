@@ -200,7 +200,15 @@ public:
    * Return the ptrace message pid associated with the current ptrace
    * event, f.e. the new child's pid at PTRACE_EVENT_CLONE.
    */
-  pid_t get_ptrace_eventmsg_pid();
+  template <typename T> T get_ptrace_eventmsg() {
+    unsigned long msg = 0;
+    // in theory we could hit an assertion failure if the tracee suffers
+    // a SIGKILL before we get here. But the SIGKILL would have to be
+    // precisely timed between the generation of a PTRACE_EVENT_FORK/CLONE/
+    // SYS_clone event, and us fetching the event message here.
+    xptrace(PTRACE_GETEVENTMSG, nullptr, &msg);
+    return (T)msg;
+  }
 
   /**
    * Return the siginfo at the signal-stop of this.
@@ -675,6 +683,7 @@ public:
 
   /* Points at rr's mapping of the (shared) syscall buffer. */
   struct syscallbuf_hdr* syscallbuf_hdr;
+  size_t syscallbuf_size;
   size_t num_syscallbuf_bytes;
   /* Points at the tracee's mapping of the buffer. */
   remote_ptr<struct syscallbuf_hdr> syscallbuf_child;
@@ -696,12 +705,14 @@ public:
     std::vector<struct user_desc> thread_areas;
     remote_ptr<struct syscallbuf_hdr> syscallbuf_child;
     std::vector<uint8_t> syscallbuf_hdr;
+    size_t syscallbuf_size;
     size_t num_syscallbuf_bytes;
     remote_ptr<char> syscallbuf_fds_disabled_child;
     remote_ptr<struct mprotect_record> mprotect_records;
     remote_ptr<void> scratch_ptr;
     ssize_t scratch_size;
     remote_ptr<void> top_of_stack;
+    uint64_t cloned_file_data_offset;
     pid_t rec_tid;
     uint32_t serial;
     int desched_fd_child;

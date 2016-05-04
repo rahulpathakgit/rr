@@ -610,6 +610,9 @@ set(TESTS_WITH_PROGRAM
   async_signal_syscalls2
   async_signal_syscalls_siginfo
   async_usr1
+  block_clone_checkpoint
+  block_clone_interrupted
+  block_clone_syscallbuf_overflow
   block_intr_sigchld
   blocked_bad_ip
   breakpoint
@@ -618,6 +621,7 @@ set(TESTS_WITH_PROGRAM
   call_function
   checkpoint_dying_threads
   checkpoint_mixed_mode
+  checksum_sanity
   clone_interruption
   clone_vfork
   conditional_breakpoint_calls
@@ -658,6 +662,7 @@ set(TESTS_WITH_PROGRAM
   reverse_step_threads_break
   search
   segfault
+  shared_map
   shared_persistent_file
   signal_numbers
   stack_growth
@@ -718,7 +723,6 @@ set(TESTS_WITHOUT_PROGRAM
   checkpoint_mmap_shared
   checkpoint_prctl_name
   checkpoint_simple
-  checksum_sanity
   cont_signal
   cpuid
   dead_thread_target
@@ -780,6 +784,12 @@ foreach(test ${BASIC_TESTS} ${TESTS_WITH_PROGRAM})
   add_dependencies(${test} Generated)
   target_link_libraries(${test} -lrt)
 endforeach(test)
+
+# Test disabled because it requires libuvc to be built and installed, and a
+# working USB camera
+# add_executable(usb src/test/usb.c)
+# add_dependencies(usb Generated)
+# target_link_libraries(usb -lrt -L/usr/local/lib -luvc -lusb-1.0)
 
 foreach(test ${BASIC_CPP_TESTS})
   add_executable(${test} src/test/${test}.cc)

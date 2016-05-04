@@ -26,7 +26,7 @@ template <typename Arch> struct socketcall_args {
   typename Arch::signed_long args[3];
 } __attribute__((packed));
 
-void AutoRestoreMem::init(const uint8_t* mem, ssize_t num_bytes) {
+void AutoRestoreMem::init(const void* mem, ssize_t num_bytes) {
   ASSERT(remote.task(), !remote.regs().sp().is_null())
       << "Memory parameters were disabled";
 
@@ -71,6 +71,7 @@ AutoRemoteSyscalls::AutoRemoteSyscalls(Task* t,
   } else {
     initial_regs.set_sp(remote_ptr<void>());
   }
+  t->vm()->suspend_breakpoint_at(initial_regs.ip());
 }
 
 static bool is_usable_area(const KernelMapping& km) {
@@ -108,6 +109,7 @@ void AutoRemoteSyscalls::maybe_fix_stack_pointer() {
 AutoRemoteSyscalls::~AutoRemoteSyscalls() { restore_state_to(t); }
 
 void AutoRemoteSyscalls::restore_state_to(Task* t) {
+  t->vm()->restore_breakpoint_at(initial_regs.ip());
   initial_regs.set_ip(initial_ip);
   initial_regs.set_sp(initial_sp);
   // Restore stomped registers.
@@ -424,6 +426,24 @@ remote_ptr<void> AutoRemoteSyscalls::infallible_mmap_syscall(
     ASSERT(t, addr == ret) << "MAP_FIXED at " << addr << " but got " << ret;
   }
   return ret;
+}
+
+int64_t AutoRemoteSyscalls::infallible_lseek_syscall(int fd, int64_t offset,
+                                                     int whence) {
+  switch (arch()) {
+    case x86: {
+      AutoRestoreMem mem(*this, &offset, sizeof(int64_t));
+      infallible_syscall(syscall_number_for__llseek(arch()), fd, offset >> 32,
+                         offset, mem.get(), whence);
+      return t->read_mem(mem.get().cast<int64_t>());
+    }
+    case x86_64:
+      return infallible_syscall(syscall_number_for_lseek(arch()), fd, offset,
+                                whence);
+    default:
+      ASSERT(task(), false) << "Unknown arch";
+      return -1;
+  }
 }
 
 void AutoRemoteSyscalls::check_syscall_result(int syscallno) {

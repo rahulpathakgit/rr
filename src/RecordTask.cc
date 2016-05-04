@@ -407,6 +407,7 @@ template <typename Arch> void RecordTask::init_buffers_arch() {
 
   args.cloned_file_data_fd = -1;
   if (as->syscallbuf_enabled()) {
+    args.syscallbuf_size = syscallbuf_size = session().syscall_buffer_size();
     init_syscall_buffer(remote, nullptr);
     args.syscallbuf_ptr = syscallbuf_child;
     desched_fd_child = args.desched_counter_fd;
@@ -428,21 +429,23 @@ template <typename Arch> void RecordTask::init_buffers_arch() {
                            free_fd, O_CLOEXEC);
         if (cloned_file_data_fd_child != free_fd) {
           ASSERT(this, cloned_file_data_fd_child < 0);
-          remote.infallible_syscall(syscall_number_for_close(arch()), free_fd);
+          LOG(warn) << "Couldn't dup clone-data file to free fd";
+          cloned_file_data_fd_child = cloned_file_data;
         } else {
           // Prevent the child from closing this fd. We're going to close it
           // ourselves and we don't want the child closing it and then reopening
           // its own file with this fd.
           fds->add_monitor(cloned_file_data_fd_child,
                            new PreserveFileMonitor());
-          args.cloned_file_data_fd = cloned_file_data_fd_child;
+          remote.infallible_syscall(syscall_number_for_close(arch()),
+                                    cloned_file_data);
         }
-        remote.infallible_syscall(syscall_number_for_close(arch()),
-                                  cloned_file_data);
+        args.cloned_file_data_fd = cloned_file_data_fd_child;
       }
     }
   } else {
     args.syscallbuf_ptr = remote_ptr<void>(nullptr);
+    args.syscallbuf_size = 0;
   }
   args.scratch_buf = scratch_ptr;
   args.scratch_size = scratch_size;
@@ -1020,9 +1023,6 @@ void RecordTask::record_local(remote_ptr<void> addr, ssize_t num_bytes,
 void RecordTask::record_remote(remote_ptr<void> addr, ssize_t num_bytes) {
   maybe_flush_syscallbuf();
 
-  // We shouldn't be recording a scratch address.
-  ASSERT(this, !addr || addr != scratch_ptr);
-
   assert(num_bytes >= 0);
 
   if (!addr) {
@@ -1037,8 +1037,6 @@ void RecordTask::record_remote_fallible(remote_ptr<void> addr,
                                         ssize_t num_bytes) {
   maybe_flush_syscallbuf();
 
-  // We shouldn't be recording a scratch address.
-  ASSERT(this, !addr || addr != scratch_ptr);
   ASSERT(this, num_bytes >= 0);
 
   vector<uint8_t> buf;
@@ -1053,9 +1051,6 @@ void RecordTask::record_remote_fallible(remote_ptr<void> addr,
 void RecordTask::record_remote_even_if_null(remote_ptr<void> addr,
                                             ssize_t num_bytes) {
   maybe_flush_syscallbuf();
-
-  // We shouldn't be recording a scratch address.
-  ASSERT(this, !addr || addr != scratch_ptr);
 
   assert(num_bytes >= 0);
 
@@ -1218,7 +1213,7 @@ pid_t RecordTask::find_newborn_thread() {
   ASSERT(this, session().is_recording());
   ASSERT(this, ptrace_event() == PTRACE_EVENT_CLONE);
 
-  pid_t hint = get_ptrace_eventmsg_pid();
+  pid_t hint = get_ptrace_eventmsg<pid_t>();
   char path[PATH_MAX];
   sprintf(path, "/proc/%d/task/%d", tid, hint);
   struct stat stat_buf;
@@ -1272,7 +1267,7 @@ pid_t RecordTask::find_newborn_child_process() {
   ASSERT(this, ptrace_event() == PTRACE_EVENT_CLONE ||
                    ptrace_event() == PTRACE_EVENT_FORK);
 
-  pid_t hint = get_ptrace_eventmsg_pid();
+  pid_t hint = get_ptrace_eventmsg<pid_t>();
   // This should always succeed, but may fail in old kernels due to
   // a kernel bug. See RecordSession::handle_ptrace_event.
   if (!session().find_task(hint) && get_ppid(hint) == real_tgid()) {

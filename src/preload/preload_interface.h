@@ -32,9 +32,6 @@
  * so we can't use it. */
 #define SYSCALLBUF_DESCHED_SIGNAL SIGPWR
 
-/* This size counts the header along with record data. */
-#define SYSCALLBUF_BUFFER_SIZE (1 << 20)
-
 /* Set this env var to enable syscall buffering. */
 #define SYSCALLBUF_ENABLED_ENV_VAR "_RR_USE_SYSCALLBUF"
 
@@ -159,8 +156,7 @@ struct rrcall_init_preload_params {
   int syscall_patch_hook_count;
   PTR(struct syscall_patch_hook) syscall_patch_hooks;
   PTR(void) syscall_hook_trampoline;
-  PTR(void) syscall_hook_stub_buffer;
-  PTR(void) syscall_hook_stub_buffer_end;
+  PTR(void) syscall_hook_end;
   /* Array of size SYSCALLBUF_FDS_DISABLED_SIZE */
   PTR(volatile char) syscallbuf_fds_disabled;
   PTR(struct mprotect_record) mprotect_records;
@@ -193,7 +189,8 @@ struct rrcall_init_buffers_params {
   PTR(void) syscallbuf_ptr;
   /* Returned pointer to rr's syscall scratch buffer */
   PTR(void) scratch_buf;
-  size_t scratch_size;
+  uint32_t syscallbuf_size;
+  uint32_t scratch_size;
 };
 
 /**
@@ -266,8 +263,6 @@ struct syscallbuf_hdr {
    * When it's zero, the desched signal can safely be
    * discarded. */
   uint8_t desched_signal_may_be_relevant;
-
-  uint8_t padding[4];
 
   struct syscallbuf_record recs[0];
 } __attribute__((__packed__));

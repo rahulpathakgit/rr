@@ -9,6 +9,7 @@
 #include "DiversionSession.h"
 #include "EmuFs.h"
 #include "Session.h"
+#include "Task.h"
 
 struct syscallbuf_hdr;
 
@@ -174,12 +175,6 @@ public:
 
   EmuFs& emufs() const { return *emu_fs; }
 
-  /** Collect garbage files from this session's emufs. */
-  void gc_emufs();
-
-  /** Run emufs gc if this syscall may release a file */
-  void maybe_gc_emufs(SupportedArch arch, int syscallno);
-
   TraceReader& trace_reader() { return trace_in; }
   const TraceReader& trace_reader() const { return trace_in; }
 
@@ -293,7 +288,7 @@ private:
 
   ReplaySession(const ReplaySession& other)
       : Session(other),
-        emu_fs(other.emu_fs->clone()),
+        emu_fs(EmuFs::create()),
         trace_in(other.trace_in),
         trace_frame(other.trace_frame),
         current_step(other.current_step),

@@ -4,7 +4,6 @@
 
 #include <inttypes.h>
 #include <limits.h>
-#include <linux/btrfs.h>
 #include <sysexits.h>
 
 #include <fstream>
@@ -12,7 +11,10 @@
 #include <sstream>
 
 #include "AddressSpace.h"
+#include "kernel_supplement.h"
 #include "log.h"
+#include "RecordSession.h"
+#include "Task.h"
 #include "TaskishUid.h"
 #include "util.h"
 
@@ -29,7 +31,7 @@ namespace rr {
 // MUST increment this version number.  Otherwise users' old traces
 // will become unreplayable and they won't know why.
 //
-#define TRACE_VERSION 49
+#define TRACE_VERSION 52
 
 struct SubstreamData {
   const char* name;
@@ -38,9 +40,9 @@ struct SubstreamData {
 };
 
 static SubstreamData substreams[TraceStream::SUBSTREAM_COUNT] = {
-  { "events", 1024 * 1024, 1 },   { "data_header", 1024 * 1024, 1 },
-  { "data", 8 * 1024 * 1024, 0 }, { "mmaps", 64 * 1024, 1 },
-  { "tasks", 64 * 1024, 1 },      { "generic", 64 * 1024, 1 },
+  { "events", 1024 * 1024, 1 }, { "data_header", 1024 * 1024, 1 },
+  { "data", 1024 * 1024, 0 },   { "mmaps", 64 * 1024, 1 },
+  { "tasks", 64 * 1024, 1 },    { "generic", 64 * 1024, 1 },
 };
 
 static const SubstreamData& substream(TraceStream::Substream s) {
@@ -275,6 +277,7 @@ void TraceWriter::write_task_event(const TraceTaskEvent& event) {
       tasks << event.file_name() << event.cmd_line() << event.fds_to_close();
       break;
     case TraceTaskEvent::EXIT:
+      tasks << event.exit_status_;
       break;
     case TraceTaskEvent::NONE:
       assert(0 && "Writing NONE TraceTaskEvent");
@@ -297,6 +300,7 @@ TraceTaskEvent TraceReader::read_task_event() {
       tasks >> r.file_name_ >> r.cmd_line_ >> r.fds_to_close_;
       break;
     case TraceTaskEvent::EXIT:
+      tasks >> r.exit_status_;
       break;
     case TraceTaskEvent::NONE:
       // Should be EOF only
@@ -355,7 +359,8 @@ bool TraceWriter::try_clone_file(const string& file_name, string* new_name) {
 }
 
 TraceWriter::RecordInTrace TraceWriter::write_mapped_region(
-    const KernelMapping& km, const struct stat& stat, MappingOrigin origin) {
+    Task* t, const KernelMapping& km, const struct stat& stat,
+    MappingOrigin origin) {
   auto& mmaps = writer(MMAPS);
   TraceReader::MappedDataSource source;
   string backing_file_name;
@@ -364,7 +369,9 @@ TraceWriter::RecordInTrace TraceWriter::write_mapped_region(
   } else if (origin == SYSCALL_MAPPING &&
              (km.inode() == 0 || km.fsname() == "/dev/zero (deleted)")) {
     source = TraceReader::SOURCE_ZERO;
-  } else if (try_clone_file(km.fsname(), &backing_file_name)) {
+  } else if ((km.flags() & MAP_PRIVATE) &&
+             t->session().as_record()->use_file_cloning() &&
+             try_clone_file(km.fsname(), &backing_file_name)) {
     source = TraceReader::SOURCE_FILE;
   } else if (should_copy_mmap_region(km, stat) &&
              files_assumed_immutable.find(make_pair(

@@ -33,7 +33,9 @@ public:
       BindCPU bind_cpu = BIND_CPU);
 
   bool use_syscall_buffer() const { return use_syscall_buffer_; }
+  size_t syscall_buffer_size() const { return syscall_buffer_size_; }
   bool use_read_cloning() const { return use_read_cloning_; }
+  bool use_file_cloning() const { return use_file_cloning_; }
   void set_ignore_sig(int sig) { ignore_sig = sig; }
   int get_ignore_sig() const { return ignore_sig; }
   void set_continue_through_sig(int sig) { continue_through_sig = sig; }
@@ -99,7 +101,9 @@ public:
   }
   bool enable_chaos() const { return enable_chaos_; }
 
-  void set_use_read_cloning(bool enable) { this->use_read_cloning_ = enable; }
+  void set_use_read_cloning(bool enable) { use_read_cloning_ = enable; }
+  void set_use_file_cloning(bool enable) { use_file_cloning_ = enable; }
+  void set_syscall_buffer_size(size_t size) { syscall_buffer_size_ = size; }
 
   void set_wait_for_all(bool wait_for_all) {
     this->wait_for_all_ = wait_for_all;
@@ -138,8 +142,10 @@ private:
   int ignore_sig;
   int continue_through_sig;
   Switchable last_task_switchable;
+  size_t syscall_buffer_size_;
   bool use_syscall_buffer_;
 
+  bool use_file_cloning_;
   bool use_read_cloning_;
   /**
    * When true, try to increase the probability of finding bugs.

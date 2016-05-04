@@ -101,12 +101,14 @@ static void init_scratch_memory(ReplayTask* t, const KernelMapping& km,
   size_t sz = t->scratch_size;
   // Make the scratch buffer read/write during replay so that
   // preload's sys_read can use it to buffer cloned data.
-  int prot = PROT_READ | PROT_WRITE;
-  int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
+  ASSERT(t, (km.prot() & (PROT_READ | PROT_WRITE)) == (PROT_READ | PROT_WRITE));
+  ASSERT(t, (km.flags() & (MAP_PRIVATE | MAP_ANONYMOUS)) ==
+                (MAP_PRIVATE | MAP_ANONYMOUS));
 
   AutoRemoteSyscalls remote(t);
-  remote.infallible_mmap_syscall(t->scratch_ptr, sz, prot, flags, -1, 0);
-  t->vm()->map(t->scratch_ptr, sz, prot, flags, 0, string(),
+  remote.infallible_mmap_syscall(t->scratch_ptr, sz, km.prot(),
+                                 km.flags() | MAP_FIXED, -1, 0);
+  t->vm()->map(t->scratch_ptr, sz, km.prot(), km.flags(), 0, string(),
                KernelMapping::NO_DEVICE, KernelMapping::NO_INODE, &km);
 }
 
@@ -210,7 +212,7 @@ template <typename Arch> static void prepare_clone(ReplayTask* t) {
       t, Arch::clone == sys ? TraceTaskEvent::CLONE : TraceTaskEvent::FORK);
   ASSERT(t, tte.parent_tid() == t->rec_tid);
   long rec_tid = tte.tid();
-  pid_t new_tid = t->get_ptrace_eventmsg_pid();
+  pid_t new_tid = t->get_ptrace_eventmsg<pid_t>();
 
   CloneParameters params;
   if (Arch::clone == t->regs().original_syscallno()) {
@@ -542,6 +544,7 @@ static remote_ptr<void> finish_anonymous_mmap(
   dev_t device = KernelMapping::NO_DEVICE;
   ino_t inode = KernelMapping::NO_INODE;
   KernelMapping recorded_km;
+  EmuFile::shr_ptr emu_file;
   if (flags & MAP_PRIVATE) {
     remote.infallible_mmap_syscall(rec_addr, length, prot,
                                    // Tell the kernel to take |rec_addr|
@@ -554,10 +557,10 @@ static remote_ptr<void> finish_anonymous_mmap(
     TraceReader::MappedData data;
     recorded_km = remote.task()->trace_reader().read_mapped_region(&data);
     ASSERT(remote.task(), data.source == TraceReader::SOURCE_ZERO);
-    auto emufile = t->session().emufs().get_or_create(recorded_km, length);
+    emu_file = t->session().emufs().get_or_create(recorded_km, length);
     struct stat real_file;
     finish_direct_mmap(t, remote, rec_addr, length, prot,
-                       flags & ~MAP_ANONYMOUS, emufile->proc_path(), 0,
+                       flags & ~MAP_ANONYMOUS, emu_file->proc_path(), 0,
                        real_file, file_name);
     device = real_file.st_dev;
     inode = real_file.st_ino;
@@ -565,7 +568,7 @@ static remote_ptr<void> finish_anonymous_mmap(
 
   if (note_task_map) {
     remote.task()->vm()->map(rec_addr, length, prot, flags, 0, file_name,
-                             device, inode, &recorded_km);
+                             device, inode, &recorded_km, emu_file);
   }
   return rec_addr;
 }
@@ -680,7 +683,8 @@ static void finish_shared_mmap(ReplayTask* t, AutoRemoteSyscalls& remote,
              << emufile->emu_path();
 
   t->vm()->map(buf.addr, buf.data.size(), prot, flags, offset_bytes,
-               real_file_name, real_file.st_dev, real_file.st_ino, &km);
+               real_file_name, real_file.st_dev, real_file.st_ino, &km,
+               emufile);
 }
 
 static void process_mmap(ReplayTask* t, const TraceFrame& trace_frame,
@@ -1088,6 +1092,22 @@ static void rep_process_syscall_arch(ReplayTask* t, ReplayTraceStep* step) {
         uint32_t iov_cnt = t->regs().arg5();
         for (uint32_t i = 0; i < iov_cnt; ++i) {
           dest->set_data_from_trace();
+        }
+      }
+      return;
+    }
+
+    case Arch::read: {
+      int fd = (int)t->regs().arg1();
+      if (!trace_regs.syscall_failed() && t->cloned_file_data_fd_child >= 0) {
+        string file_name = t->file_name_of_fd(fd);
+        if (!file_name.empty() &&
+            file_name == t->file_name_of_fd(t->cloned_file_data_fd_child)) {
+          // This is a read of the cloned-data file. Replay logic depends on
+          // this file's offset actually advancing.
+          AutoRemoteSyscalls remote(t);
+          remote.infallible_lseek_syscall(fd, trace_regs.syscall_result(),
+                                          SEEK_CUR);
         }
       }
       return;

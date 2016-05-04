@@ -8,12 +8,13 @@
 #include <string>
 #include <vector>
 
-#include "AddressSpace.h"
 #include "ScopedFd.h"
-#include "Task.h"
 
 namespace rr {
 
+class AddressSpace;
+class EmuFs;
+class KernelMapping;
 class ReplaySession;
 class Session;
 class Task;
@@ -38,7 +39,7 @@ class Task;
  * F_0 at trace time t_0 has the same (device, inode) ID as a
  * different file F_1 at trace time t_1.  By definition, if the inode
  * ID was recycled in [t_0, t_1), then all references to F_0 must have
- * been dropped in that inverval.  A corollary of that is that all
+ * been dropped in that interval.  A corollary of that is that all
  * memory mappings of F_0 must have been fully unmapped in the
  * interval.  As per the first long comment in |gc()| below, an
  * emulated file can only be "live" during replay if some tracee still
@@ -88,7 +89,7 @@ public:
 private:
   friend class EmuFs;
 
-  EmuFile(ScopedFd&& fd, const std::string& orig_path,
+  EmuFile(EmuFs& owner, ScopedFd&& fd, const std::string& orig_path,
           const std::string& real_path, dev_t device, ino_t inode,
           uint64_t file_size);
 
@@ -96,14 +97,7 @@ private:
    * Return a copy of this file.  See |create()| for the meaning
    * of |fs_tag|.
    */
-  shr_ptr clone();
-
-  /**
-   * Mark/unmark/check to see if this file is marked.
-   */
-  void mark() { is_marked = true; }
-  bool marked() const { return is_marked; }
-  void unmark() { is_marked = false; }
+  shr_ptr clone(EmuFs& owner);
 
   /**
    * Ensure that the emulated file is sized to match a later
@@ -117,16 +111,17 @@ private:
    * uniquely identify this file among multiple EmuFs's that
    * might exist concurrently in this tracer process.
    */
-  static shr_ptr create(const std::string& orig_path, dev_t orig_device,
-                        ino_t orig_inode, uint64_t orig_file_size);
+  static shr_ptr create(EmuFs& owner, const std::string& orig_path,
+                        dev_t orig_device, ino_t orig_inode,
+                        uint64_t orig_file_size);
 
   std::string orig_path;
   std::string tmp_path;
   ScopedFd file;
+  EmuFs& owner;
   uint64_t size_;
   dev_t device_;
   ino_t inode_;
-  bool is_marked;
 
   EmuFile(const EmuFile&) = delete;
   EmuFile operator=(const EmuFile&) = delete;
@@ -144,12 +139,7 @@ public:
 
   bool has_file_for(const KernelMapping& recorded_map) const;
 
-  /**
-   * Return a copy of this fs such that |at()| and |get_or_create()| will
-   * return semantically identical results as this, and such that mutations of
-   * the returned fs won't affect this and vice versa.
-   */
-  shr_ptr clone();
+  EmuFile::shr_ptr clone_file(EmuFile::shr_ptr emu_file);
 
   /**
    * Return an emulated file representing the recorded shared mapping
@@ -168,27 +158,15 @@ public:
   /** Create and return a new emufs. */
   static shr_ptr create();
 
-  /**
-   * Collect emulated files that aren't referenced by tracees.
-   * Call this only when a tracee's (possibly shared) file table
-   * has been destroyed.  All other gc triggers are handled
-   * internally.
-   */
-  void gc(const Session& session);
+  void destroyed_file(EmuFile& emu_file) { files.erase(FileId(emu_file)); }
 
 private:
   EmuFs();
 
-  /**
-   * Mark all the files being used by the tasks in |as|, and
-   * increment |nt_marked_files| by the number of files that
-   * were marked.
-   */
-  void mark_used_vfiles(const AddressSpace& as, size_t* nr_marked_files);
-
   struct FileId {
-    FileId(const KernelMapping& recorded_map)
-        : device(recorded_map.device()), inode(recorded_map.inode()) {}
+    FileId(const KernelMapping& recorded_map);
+    FileId(const EmuFile& emu_file)
+        : device(emu_file.device()), inode(emu_file.inode()) {}
     bool operator<(const FileId& other) const {
       return device < other.device ||
              (device == other.device && inode < other.inode);
@@ -197,7 +175,7 @@ private:
     ino_t inode;
   };
 
-  typedef std::map<FileId, EmuFile::shr_ptr> FileMap;
+  typedef std::map<FileId, std::weak_ptr<EmuFile> > FileMap;
 
   FileMap files;
 

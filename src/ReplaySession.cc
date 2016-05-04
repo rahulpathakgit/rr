@@ -78,7 +78,6 @@ ReplaySession::~ReplaySession() {
   // resources.
   kill_all_tasks();
   assert(task_map.empty() && vm_map.empty());
-  gc_emufs();
   assert(emufs().size() == 0);
 }
 
@@ -90,7 +89,7 @@ ReplaySession::shr_ptr ReplaySession::clone() {
   shr_ptr session(new ReplaySession(*this));
   LOG(debug) << "  deepfork session is " << session.get();
 
-  copy_state_to(*session, session->emufs());
+  copy_state_to(*session, emufs(), session->emufs());
 
   return session;
 }
@@ -135,10 +134,10 @@ DiversionSession::shr_ptr ReplaySession::clone_diversion() {
   LOG(debug) << "Deepforking ReplaySession " << this
              << " to DiversionSession...";
 
-  DiversionSession::shr_ptr session(new DiversionSession(*this));
+  DiversionSession::shr_ptr session(new DiversionSession());
   LOG(debug) << "  deepfork session is " << session.get();
 
-  copy_state_to(*session, session->emufs());
+  copy_state_to(*session, emufs(), session->emufs());
   session->finish_initializing();
 
   return session;
@@ -147,14 +146,6 @@ DiversionSession::shr_ptr ReplaySession::clone_diversion() {
 Task* ReplaySession::new_task(pid_t tid, pid_t rec_tid, uint32_t serial,
                               SupportedArch a) {
   return new ReplayTask(*this, tid, rec_tid, serial, a);
-}
-
-void ReplaySession::gc_emufs() { emu_fs->gc(*this); }
-
-void ReplaySession::maybe_gc_emufs(SupportedArch arch, int syscallno) {
-  if (is_close_syscall(syscallno, arch) || is_munmap_syscall(syscallno, arch)) {
-    gc_emufs();
-  }
 }
 
 /*static*/ ReplaySession::shr_ptr ReplaySession::create(const string& dir) {
@@ -266,10 +257,19 @@ Completion ReplaySession::cont_syscall_boundary(
   auto type = AddressSpace::rr_page_syscall_from_exit_point(t->ip());
   if (type && type->traced == AddressSpace::UNTRACED &&
       type->enabled == AddressSpace::REPLAY_ONLY) {
-    // Ignore these. They didn't happend during recording and we don't
-    // want to know about them during replay.
+    t->finish_emulated_syscall();
+    // Actually perform it. We can hit these when replaying through syscallbuf
+    // code that was interrupted.
+    {
+      AutoRemoteSyscalls remote(t);
+      const Registers& r = t->regs();
+      long ret = remote.syscall(r.original_syscallno(), r.arg1(), r.arg2(),
+                                r.arg3(), r.arg4(), r.arg5(), r.arg6());
+      remote.regs().set_syscall_result(ret);
+    }
     return cont_syscall_boundary(t, constraints);
   }
+
   return COMPLETE;
 }
 
@@ -823,7 +823,7 @@ void ReplaySession::prepare_syscallbuf_records(ReplayTask* t) {
   // region.
   auto buf = t->trace_reader().read_raw_data();
   ASSERT(t, buf.data.size() >= sizeof(struct syscallbuf_hdr));
-  ASSERT(t, buf.data.size() <= SYSCALLBUF_BUFFER_SIZE);
+  ASSERT(t, buf.data.size() <= t->syscallbuf_size);
   ASSERT(t, buf.addr == t->syscallbuf_child.cast<void>());
 
   struct syscallbuf_hdr recorded_hdr;
@@ -834,7 +834,7 @@ void ReplaySession::prepare_syscallbuf_records(ReplayTask* t) {
          buf.data.size() - sizeof(struct syscallbuf_hdr));
 
   ASSERT(t, recorded_hdr.num_rec_bytes + sizeof(struct syscallbuf_hdr) <=
-                SYSCALLBUF_BUFFER_SIZE);
+                t->syscallbuf_size);
 
   current_step.flush.stop_breakpoint_addr =
       t->stopping_breakpoint_table.to_data_ptr<void>().as_int() +
@@ -898,7 +898,6 @@ Completion ReplaySession::flush_syscallbuf(ReplayTask* t,
   struct syscallbuf_record* end_rec = next_record(t->syscallbuf_hdr);
   while (next_rec != end_rec) {
     accumulate_syscall_performed();
-    maybe_gc_emufs(t->arch(), next_rec->syscallno);
     next_rec = (struct syscallbuf_record*)((uint8_t*)next_rec +
                                            stored_record_size(next_rec->size));
   }
@@ -1079,7 +1078,6 @@ Completion ReplaySession::exit_task(ReplayTask* t) {
   t->apply_all_data_records_from_trace();
   end_task(t);
   /* |t| is dead now. */
-  gc_emufs();
   return COMPLETE;
 }
 
@@ -1182,7 +1180,6 @@ void ReplaySession::setup_replay_one_trace_frame(ReplayTask* t) {
         rep_process_syscall(t, &current_step);
         if (current_step.action == TSTEP_RETIRE) {
           t->on_syscall_exit(current_step.syscall.number, trace_frame.regs());
-          maybe_gc_emufs(t->arch(), trace_frame.regs().syscallno());
         }
       }
       break;

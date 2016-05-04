@@ -10,7 +10,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
-#include <linux/btrfs.h>
 #include <linux/ethtool.h>
 #include <linux/futex.h>
 #include <linux/if.h>
@@ -1101,6 +1100,34 @@ static void record_v4l2_buffer_contents(RecordTask* t) {
   }
 }
 
+template <typename Arch> static void record_usbdevfs_reaped_urb(RecordTask* t) {
+  if (t->regs().syscall_failed()) {
+    return;
+  }
+
+  remote_ptr<typename Arch::unsigned_word> pp = t->regs().arg3();
+  remote_ptr<typename Arch::usbdevfs_urb> p = t->read_mem(pp);
+  t->record_remote(p);
+  auto urb = t->read_mem(p);
+  size_t length;
+  if (urb.type == USBDEVFS_URB_TYPE_ISO) {
+    auto iso_frame_descs_ptr = REMOTE_PTR_FIELD(p, iso_frame_desc[0]);
+    auto iso_frame_descs =
+        t->read_mem(iso_frame_descs_ptr, urb.number_of_packets);
+    length = 0;
+    for (auto& f : iso_frame_descs) {
+      length += f.length;
+    }
+    t->record_local(iso_frame_descs_ptr, iso_frame_descs.data(),
+                    iso_frame_descs.size());
+  } else {
+    length = urb.buffer_length;
+  }
+  // It's tempting to use actual_length here but in some cases the kernel
+  // writes back more data than that.
+  t->record_remote(urb.buffer, length);
+}
+
 static void record_page_below_stack_ptr(RecordTask* t) {
   /* Record.the page above the top of |t|'s stack.  The SIOC* ioctls
    * have been observed to write beyond the end of tracees' stacks, as
@@ -1204,14 +1231,28 @@ static Switchable prepare_ioctl(RecordTask* t,
   }
 
   /* In ioctl language, "_IOC_READ" means "outparam".  Both
-   * READ and WRITE can be set for inout params. */
+   * READ and WRITE can be set for inout params.
+   * USBDEVFS ioctls seem to be mostly backwards in their interpretation of the
+   * read/write bits :-(.
+   */
   if (!(_IOC_READ & dir)) {
     switch (IOCTL_MASK_SIZE(request)) {
       case IOCTL_MASK_SIZE(BTRFS_IOC_CLONE):
       case IOCTL_MASK_SIZE(BTRFS_IOC_CLONE_RANGE):
       case IOCTL_MASK_SIZE(FIOCLEX):
       case IOCTL_MASK_SIZE(FIONCLEX):
+      case IOCTL_MASK_SIZE(USBDEVFS_DISCARDURB):
+      case IOCTL_MASK_SIZE(USBDEVFS_RESET):
         return PREVENT_SWITCH;
+      case IOCTL_MASK_SIZE(USBDEVFS_GETDRIVER):
+        // Reads and writes its parameter despite not having the _IOC_READ bit.
+        syscall_state.reg_parameter(3, size);
+        return PREVENT_SWITCH;
+      case IOCTL_MASK_SIZE(USBDEVFS_REAPURB):
+      case IOCTL_MASK_SIZE(USBDEVFS_REAPURBNDELAY):
+        syscall_state.reg_parameter(3, size);
+        syscall_state.after_syscall_action(record_usbdevfs_reaped_urb<Arch>);
+        return ALLOW_SWITCH;
     }
     /* If the kernel isn't going to write any data back to
      * us, we hope and pray that the result of the ioctl
@@ -1248,8 +1289,39 @@ static Switchable prepare_ioctl(RecordTask* t,
       return PREVENT_SWITCH;
 
     case IOCTL_MASK_SIZE(TIOCGPTN):
+    case IOCTL_MASK_SIZE(USBDEVFS_GET_CAPABILITIES):
       syscall_state.reg_parameter(3, size);
       return PREVENT_SWITCH;
+
+    case IOCTL_MASK_SIZE(USBDEVFS_ALLOC_STREAMS):
+    case IOCTL_MASK_SIZE(USBDEVFS_CLAIMINTERFACE):
+    case IOCTL_MASK_SIZE(USBDEVFS_CLEAR_HALT):
+    case IOCTL_MASK_SIZE(USBDEVFS_DISCONNECT_CLAIM):
+    case IOCTL_MASK_SIZE(USBDEVFS_FREE_STREAMS):
+    case IOCTL_MASK_SIZE(USBDEVFS_RELEASEINTERFACE):
+    case IOCTL_MASK_SIZE(USBDEVFS_SETCONFIGURATION):
+    case IOCTL_MASK_SIZE(USBDEVFS_SETINTERFACE):
+    case IOCTL_MASK_SIZE(USBDEVFS_SUBMITURB):
+      // Doesn't actually seem to write to userspace
+      return PREVENT_SWITCH;
+
+    case IOCTL_MASK_SIZE(USBDEVFS_IOCTL): {
+      auto argsp =
+          syscall_state.reg_parameter<typename Arch::usbdevfs_ioctl>(3, IN);
+      auto args = t->read_mem(argsp);
+      syscall_state.mem_ptr_parameter(REMOTE_PTR_FIELD(argsp, data),
+                                      _IOC_SIZE(args.ioctl_code));
+      return PREVENT_SWITCH;
+    }
+    case IOCTL_MASK_SIZE(USBDEVFS_CONTROL): {
+      auto argsp =
+          syscall_state.reg_parameter<typename Arch::usbdevfs_ctrltransfer>(3,
+                                                                            IN);
+      auto args = t->read_mem(argsp);
+      syscall_state.mem_ptr_parameter(REMOTE_PTR_FIELD(argsp, data),
+                                      args.wLength);
+      return PREVENT_SWITCH;
+    }
   }
 
   /* These ioctls are mostly regular but require additional recording. */
@@ -2011,7 +2083,7 @@ static void init_scratch_memory(RecordTask* t,
                    KernelMapping::NO_DEVICE, KernelMapping::NO_INODE);
   struct stat stat;
   memset(&stat, 0, sizeof(stat));
-  auto record_in_trace = t->trace_writer().write_mapped_region(km, stat);
+  auto record_in_trace = t->trace_writer().write_mapped_region(t, km, stat);
   ASSERT(t, record_in_trace == TraceWriter::DONT_RECORD_IN_TRACE);
 
   r.set_syscall_result(saved_result);
@@ -2136,10 +2208,10 @@ static void prepare_clone(RecordTask* t, TaskSyscallState& syscall_state) {
     new_task->record_remote_even_if_null(child_params.ctid);
 
     t->session().trace_writer().write_task_event(
-        TraceTaskEvent(new_task->tid, t->tid, flags));
+        TraceTaskEvent::for_clone(new_task->tid, t->tid, flags));
   } else {
     t->session().trace_writer().write_task_event(
-        TraceTaskEvent(new_task->tid, t->tid));
+        TraceTaskEvent::for_fork(new_task->tid, t->tid));
   }
 
   init_scratch_memory(new_task);
@@ -2187,13 +2259,26 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
                                            TaskSyscallState& syscall_state) {
   int syscallno = t->ev().Syscall().number;
 
+  syscall_state.syscall_entry_registers = t->regs();
+
   if (t->desched_rec()) {
-    /* |t| was descheduled while in a buffered syscall.  We don't
+    /* |t| was descheduled while in a buffered syscall.  We normally don't
      * use scratch memory for the call, because the syscallbuf itself
      * is serving that purpose. More importantly, we *can't* set up
      * scratch for |t|, because it's already in the syscall. Instead, we will
      * record the syscallbuf memory in rec_process_syscall_arch.
+     *
+     * However there is one case where we use scratch memory: when
+     * sys_read's block-cloning path is interrupted. In that case, record
+     * the scratch memory.
      */
+    if (syscallno == Arch::read &&
+        remote_ptr<void>(t->regs().arg2()) == t->scratch_ptr) {
+      syscall_state.reg_parameter(
+          2, ParamSize::from_syscall_result<typename Arch::ssize_t>(
+                 (size_t)t->regs().arg3()),
+          IN_OUT_NO_SCRATCH);
+    }
     return ALLOW_SWITCH;
   }
 
@@ -2203,8 +2288,6 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
     syscall_state.expect_errno = ENOSYS;
     return PREVENT_SWITCH;
   }
-
-  syscall_state.syscall_entry_registers = t->regs();
 
   switch (syscallno) {
 // All the regular syscalls are handled here.
@@ -2287,8 +2370,9 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
 
       // Save the event. We can't record it here because the exec might fail.
       string raw_filename = t->read_c_str(t->regs().arg1());
-      syscall_state.exec_saved_event = unique_ptr<TraceTaskEvent>(
-          new TraceTaskEvent(t->tid, raw_filename, cmd_line));
+      syscall_state.exec_saved_event =
+          unique_ptr<TraceTaskEvent>(new TraceTaskEvent(
+              TraceTaskEvent::for_exec(t->tid, raw_filename, cmd_line)));
 
       return PREVENT_SWITCH;
     }
@@ -3339,7 +3423,7 @@ static void process_execve(RecordTask* t, TaskSyscallState& syscall_state) {
 
     for (auto& km : stacks) {
       auto mode = t->trace_writer().write_mapped_region(
-          km, km.fake_stat(), TraceWriter::EXEC_MAPPING);
+          t, km, km.fake_stat(), TraceWriter::EXEC_MAPPING);
       ASSERT(t, mode == TraceWriter::RECORD_IN_TRACE);
       auto buf = t->read_mem(km.start().cast<uint8_t>(), km.size());
       t->trace_writer().write_raw(buf.data(), km.size(), km.start());
@@ -3383,7 +3467,7 @@ static void process_execve(RecordTask* t, TaskSyscallState& syscall_state) {
     if (stat(km.fsname().c_str(), &st) != 0) {
       st = km.fake_stat();
     }
-    if (t->trace_writer().write_mapped_region(km, st,
+    if (t->trace_writer().write_mapped_region(t, km, st,
                                               TraceWriter::EXEC_MAPPING) ==
         TraceWriter::RECORD_IN_TRACE) {
       if (st.st_size > 0) {
@@ -3440,7 +3524,7 @@ static void process_mmap(RecordTask* t, size_t length, int prot, int flags,
       KernelMapping km =
           t->vm()->map(addr, size, prot, flags, 0, kernel_info.fsname(),
                        kernel_info.device(), kernel_info.inode());
-      auto d = t->trace_writer().write_mapped_region(km, km.fake_stat());
+      auto d = t->trace_writer().write_mapped_region(t, km, km.fake_stat());
       ASSERT(t, d == TraceWriter::DONT_RECORD_IN_TRACE);
     }
     return;
@@ -3459,7 +3543,7 @@ static void process_mmap(RecordTask* t, size_t length, int prot, int flags,
   KernelMapping km = t->vm()->map(addr, size, prot, flags, offset, file_name,
                                   result.st_dev, result.st_ino);
 
-  if (t->trace_writer().write_mapped_region(km, result) ==
+  if (t->trace_writer().write_mapped_region(t, km, result) ==
       TraceWriter::RECORD_IN_TRACE) {
     if (result.st_size > 0) {
       off64_t end = (off64_t)result.st_size - offset;
@@ -3505,7 +3589,7 @@ static void process_shmat(RecordTask* t, int shmid, int shm_flags,
   KernelMapping km =
       t->vm()->map(addr, size, prot, flags, 0, kernel_info.fsname(),
                    kernel_info.device(), kernel_info.inode());
-  if (t->trace_writer().write_mapped_region(km, km.fake_stat()) ==
+  if (t->trace_writer().write_mapped_region(t, km, km.fake_stat()) ==
       TraceWriter::RECORD_IN_TRACE) {
     t->record_remote(addr, size);
   }
@@ -3725,7 +3809,7 @@ static void rec_process_syscall_arch(RecordTask* t,
         km = KernelMapping(new_brk, old_brk, string(), KernelMapping::NO_DEVICE,
                            KernelMapping::NO_INODE, 0, 0, 0);
       }
-      auto d = t->trace_writer().write_mapped_region(km, km.fake_stat());
+      auto d = t->trace_writer().write_mapped_region(t, km, km.fake_stat());
       ASSERT(t, d == TraceWriter::DONT_RECORD_IN_TRACE);
       t->vm()->brk(t->regs().syscall_result(), km.prot());
       break;

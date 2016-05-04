@@ -65,7 +65,8 @@ Task::Task(Session& session, pid_t _tid, pid_t _rec_tid, uint32_t serial,
       tid(_tid),
       rec_tid(_rec_tid > 0 ? _rec_tid : _tid),
       syscallbuf_hdr(),
-      num_syscallbuf_bytes(),
+      syscallbuf_size(0),
+      num_syscallbuf_bytes(0),
       stopping_breakpoint_table_entry_size(0),
       serial(serial),
       prname("???"),
@@ -200,19 +201,12 @@ string Task::file_name_of_fd(int fd) {
   char path[PATH_MAX];
   snprintf(path, sizeof(path) - 1, "/proc/%d/fd/%d", tid, fd);
   ssize_t nbytes = readlink(path, path, sizeof(path) - 1);
-  ASSERT(this, nbytes >= 0);
-  path[nbytes] = '\0';
+  if (nbytes < 0) {
+    path[0] = 0;
+  } else {
+    path[nbytes] = 0;
+  }
   return path;
-}
-
-pid_t Task::get_ptrace_eventmsg_pid() {
-  unsigned long msg = 0;
-  // in theory we could hit an assertion failure if the tracee suffers
-  // a SIGKILL before we get here. But the SIGKILL would have to be
-  // precisely timed between the generation of a PTRACE_EVENT_FORK/CLONE/
-  // SYS_clone event, and us fetching the event message here.
-  xptrace(PTRACE_GETEVENTMSG, nullptr, &msg);
-  return (pid_t)msg;
 }
 
 const siginfo_t& Task::get_siginfo() {
@@ -591,7 +585,10 @@ void Task::post_exec(SupportedArch a, const string& exe_file) {
 
   syscallbuf_child = nullptr;
   syscallbuf_fds_disabled_child = nullptr;
+  cloned_file_data_fd_child = -1;
+  desched_fd_child = -1;
   mprotect_records = nullptr;
+  in_replay_flag = nullptr;
 
   thread_areas_.clear();
 
@@ -1354,9 +1351,11 @@ Task* Task::clone(int flags, remote_ptr<void> stack, remote_ptr<void> tls,
   t->syscallbuf_fds_disabled_child = syscallbuf_fds_disabled_child;
   t->mprotect_records = mprotect_records;
 
+  t->syscallbuf_size = syscallbuf_size;
   t->stopping_breakpoint_table = stopping_breakpoint_table;
   t->stopping_breakpoint_table_entry_size =
       stopping_breakpoint_table_entry_size;
+  t->in_replay_flag = in_replay_flag;
 
   // FdTable is either shared or copied, so the contents of
   // syscallbuf_fds_disabled_child are still valid.
@@ -1482,6 +1481,30 @@ static void copy_tls(const Task::CapturedState& state,
   RR_ARCH_FUNCTION(copy_tls_arch, remote.arch(), state, remote);
 }
 
+static int64_t get_fd_offset(Task* t, int fd) {
+  char buf[PATH_MAX];
+  sprintf(buf, "/proc/%d/fdinfo/%d", t->tid, fd);
+  ScopedFd info(buf, O_RDONLY);
+  ASSERT(t, info.is_open()) << "Can't open " << buf;
+  ssize_t bytes = read(info, buf, sizeof(buf) - 1);
+  ASSERT(t, bytes > 0);
+  buf[bytes] = 0;
+
+  char* p = buf;
+  while (*p) {
+    if (strncmp(p, "pos:", 4) == 0) {
+      char* end;
+      long long int r = strtoll(p + 4, &end, 10);
+      ASSERT(t, *end == 0 || *end == '\n');
+      return r;
+    }
+    while (*p && *p != '\n') {
+      ++p;
+    }
+  }
+  return -1;
+}
+
 Task::CapturedState Task::capture_state() {
   CapturedState state;
   state.rec_tid = rec_tid;
@@ -1493,7 +1516,12 @@ Task::CapturedState Task::capture_state() {
   state.num_syscallbuf_bytes = num_syscallbuf_bytes;
   state.desched_fd_child = desched_fd_child;
   state.cloned_file_data_fd_child = cloned_file_data_fd_child;
+  state.cloned_file_data_offset =
+      cloned_file_data_fd_child >= 0
+          ? get_fd_offset(this, cloned_file_data_fd_child)
+          : 0;
   state.syscallbuf_child = syscallbuf_child;
+  state.syscallbuf_size = syscallbuf_size;
   if (syscallbuf_hdr) {
     size_t data_size = syscallbuf_data_size();
     if (syscallbuf_hdr->locked) {
@@ -1534,6 +1562,7 @@ void Task::copy_state(const CapturedState& state) {
 
     copy_tls(state, remote);
     thread_areas_ = state.thread_areas;
+    syscallbuf_size = state.syscallbuf_size;
 
     ASSERT(this, !syscallbuf_child)
         << "Syscallbuf should not already be initialized in clone";
@@ -1542,6 +1571,10 @@ void Task::copy_state(const CapturedState& state) {
       num_syscallbuf_bytes = state.num_syscallbuf_bytes;
       desched_fd_child = state.desched_fd_child;
       cloned_file_data_fd_child = state.cloned_file_data_fd_child;
+      if (cloned_file_data_fd_child >= 0) {
+        remote.infallible_lseek_syscall(
+            cloned_file_data_fd_child, state.cloned_file_data_offset, SEEK_SET);
+      }
 
       // The syscallbuf is mapped as a shared
       // segment between rr and the tracee.  So we
@@ -1636,12 +1669,12 @@ void Task::init_syscall_buffer(AutoRemoteSyscalls& remote,
   unlink(path);
 
   ScopedFd shmem_fd = remote.retrieve_fd(child_shmem_fd);
-  resize_shmem_segment(shmem_fd, SYSCALLBUF_BUFFER_SIZE);
+  resize_shmem_segment(shmem_fd, syscallbuf_size);
   LOG(debug) << "created shmem segment " << path;
 
   // Map the segment in ours and the tracee's address spaces.
   void* map_addr;
-  num_syscallbuf_bytes = SYSCALLBUF_BUFFER_SIZE;
+  num_syscallbuf_bytes = syscallbuf_size;
   int prot = PROT_READ | PROT_WRITE;
   int flags = MAP_SHARED;
   if ((void*)-1 == (map_addr = mmap(nullptr, num_syscallbuf_bytes, prot, flags,
@@ -2048,7 +2081,7 @@ static void perform_remote_clone(Task* parent, AutoRemoteSyscalls& remote,
       parent->resume_execution(RESUME_SYSCALL, RESUME_WAIT, RESUME_NO_TICKS);
     }
   }
-  pid_t new_tid = parent->get_ptrace_eventmsg_pid();
+  pid_t new_tid = parent->get_ptrace_eventmsg<pid_t>();
 
   parent->resume_execution(RESUME_SYSCALL, RESUME_WAIT, RESUME_NO_TICKS);
   Task* child =

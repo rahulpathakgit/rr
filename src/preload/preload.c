@@ -48,7 +48,6 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <link.h>
-#include <linux/btrfs.h>
 #include <linux/futex.h>
 #include <linux/net.h>
 #include <linux/perf_event.h>
@@ -74,6 +73,20 @@
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifndef BTRFS_IOCTL_MAGIC
+#define BTRFS_IOCTL_MAGIC 0x94
+#endif
+#ifndef BTRFS_IOC_CLONE_RANGE
+struct btrfs_ioctl_clone_range_args {
+  int64_t src_fd;
+  uint64_t src_offset;
+  uint64_t src_length;
+  uint64_t dest_offset;
+};
+#define BTRFS_IOC_CLONE_RANGE                                                  \
+  _IOW(BTRFS_IOCTL_MAGIC, 13, struct btrfs_ioctl_clone_range_args)
+#endif
 
 /* NB: don't include any other local headers here. */
 
@@ -146,6 +159,7 @@ static __thread int thread_inited TLS_STORAGE_MODEL;
  * syscallbuf_hdr|, so |buffer| is also a pointer to the buffer
  * header. */
 static __thread uint8_t* buffer TLS_STORAGE_MODEL;
+static __thread size_t buffer_size TLS_STORAGE_MODEL;
 /* This is used to support the buffering of "may-block" system calls.
  * The problem that needs to be addressed can be introduced with a
  * simple example; assume that we're buffering the "read" and "write"
@@ -219,7 +233,7 @@ static uint8_t* buffer_last(void) {
  * Return a pointer to the byte just after the very end of the mapped
  * region.
  */
-static uint8_t* buffer_end(void) { return buffer + SYSCALLBUF_BUFFER_SIZE; }
+static uint8_t* buffer_end(void) { return buffer + buffer_size; }
 
 /**
  * Same as libc memcpy(), but usable within syscallbuf transaction
@@ -582,6 +596,7 @@ static void init_thread(void) {
   cloned_file_data_fd = args.cloned_file_data_fd;
   /* rr initializes the buffer header. */
   buffer = args.syscallbuf_ptr;
+  buffer_size = args.syscallbuf_size;
   scratch_buf = args.scratch_buf;
   scratch_size = args.scratch_size;
 
@@ -610,8 +625,7 @@ extern char _breakpoint_table_entry_end;
 static void __attribute__((constructor)) init_process(void) {
   struct rrcall_init_preload_params params;
   extern RR_HIDDEN void _syscall_hook_trampoline(void);
-  extern RR_HIDDEN void _stub_buffer(void);
-  extern RR_HIDDEN void _stub_buffer_end(void);
+  extern RR_HIDDEN void _syscall_hook_end(void);
 
 #if defined(__i386__)
   extern RR_HIDDEN void _syscall_hook_trampoline_3d_01_f0_ff_ff(void);
@@ -681,8 +695,7 @@ static void __attribute__((constructor)) init_process(void) {
   params.syscallbuf_fds_disabled =
       buffer_enabled ? syscallbuf_fds_disabled : NULL;
   params.syscall_hook_trampoline = (void*)_syscall_hook_trampoline;
-  params.syscall_hook_stub_buffer = (void*)_stub_buffer;
-  params.syscall_hook_stub_buffer_end = (void*)_stub_buffer_end;
+  params.syscall_hook_end = (void*)_syscall_hook_end;
   params.syscall_patch_hook_count =
       sizeof(syscall_patch_hooks) / sizeof(syscall_patch_hooks[0]);
   params.syscall_patch_hooks = syscall_patch_hooks;
@@ -1882,8 +1895,12 @@ static long sys_read(const struct syscall_info* call) {
           ret = untraced_replayed_syscall3(SYS_read, fd, scratch_buf, count);
           copy_output_buffer(ret, NULL, buf, scratch_buf);
         }
-        ret = commit_raw_syscall(SYS_read, ptr, ret);
+        // Do this now before we finish processing the syscallbuf record.
+        // This means the syscall will be executed in
+        // ReplaySession::flush_syscallbuf instead of
+        // ReplaySession::enter_syscall or something similar.
         replay_only_syscall1(SYS_close, fd);
+        ret = commit_raw_syscall(SYS_read, ptr, ret);
         return ret;
       }
     }
