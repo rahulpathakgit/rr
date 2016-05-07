@@ -2,6 +2,7 @@
 
 #include "Task.h"
 
+#include <asm/prctl.h>
 #include <elf.h>
 #include <errno.h>
 #include <limits.h>
@@ -55,6 +56,7 @@ Task::Task(Session& session, pid_t _tid, pid_t _rec_tid, uint32_t serial,
            SupportedArch a)
     : unstable(false),
       stable_exit(false),
+      thread_locals_initialized(false),
       scratch_ptr(),
       scratch_size(),
       // This will be initialized when the syscall buffer is.
@@ -350,6 +352,16 @@ void Task::on_syscall_exit_arch(int syscallno, const Registers& regs) {
 
     case Arch::set_thread_area:
       set_thread_area(regs.arg1());
+      // Assume any set_thread_area sets up TLS
+      thread_locals_initialized = true;
+      return;
+
+    case Arch::arch_prctl:
+      switch ((int)regs.arg1_signed()) {
+        case ARCH_SET_FS:
+          thread_locals_initialized = true;
+          break;
+      }
       return;
 
     case Arch::prctl:
@@ -584,11 +596,10 @@ void Task::post_exec(SupportedArch a, const string& exe_file) {
   set_regs(registers);
 
   syscallbuf_child = nullptr;
-  syscallbuf_fds_disabled_child = nullptr;
   cloned_file_data_fd_child = -1;
   desched_fd_child = -1;
-  mprotect_records = nullptr;
-  in_replay_flag = nullptr;
+  preload_globals = nullptr;
+  thread_locals_initialized = false;
 
   thread_areas_.clear();
 
@@ -760,6 +771,8 @@ TrapReasons Task::compute_trap_reasons() {
   return reasons;
 }
 
+static const Property<bool, AddressSpace> thread_locals_initialized_property;
+
 void Task::resume_execution(ResumeRequest how, WaitRequest wait_how,
                             TicksRequest tick_period, int sig) {
   // Treat a RESUME_NO_TICKS tick_period as a very large but finite number.
@@ -772,7 +785,21 @@ void Task::resume_execution(ResumeRequest how, WaitRequest wait_how,
     hpc.reset(tick_period == RESUME_UNLIMITED_TICKS
                   ? 0xffffffff
                   : max<Ticks>(1, tick_period));
+    // Ensure preload_globals.thread_locals_initialized is up to date. Avoid
+    // unnecessary writes by caching last written value per-AddressSpace.
+    if (preload_globals) {
+      bool* prop = thread_locals_initialized_property.get(*as);
+      if (!prop || *prop != thread_locals_initialized) {
+        write_mem(REMOTE_PTR_FIELD(preload_globals, thread_locals_initialized),
+                  (unsigned char)thread_locals_initialized);
+        if (!prop) {
+          prop = &thread_locals_initialized_property.create(*as);
+        }
+        *prop = thread_locals_initialized;
+      }
+    }
   }
+
   LOG(debug) << "resuming execution of " << tid << " with "
              << ptrace_req_name(how)
              << (sig ? string(", signal ") + signal_name(sig) : string());
@@ -1348,14 +1375,12 @@ Task* Task::clone(int flags, remote_ptr<void> stack, remote_ptr<void> tls,
   } else {
     t->as = sess.clone(t, as);
   }
-  t->syscallbuf_fds_disabled_child = syscallbuf_fds_disabled_child;
-  t->mprotect_records = mprotect_records;
 
   t->syscallbuf_size = syscallbuf_size;
   t->stopping_breakpoint_table = stopping_breakpoint_table;
   t->stopping_breakpoint_table_entry_size =
       stopping_breakpoint_table_entry_size;
-  t->in_replay_flag = in_replay_flag;
+  t->preload_globals = preload_globals;
 
   // FdTable is either shared or copied, so the contents of
   // syscallbuf_fds_disabled_child are still valid.
@@ -1377,8 +1402,14 @@ Task* Task::clone(int flags, remote_ptr<void> stack, remote_ptr<void> tls,
 
   t->open_mem_fd_if_needed();
   t->thread_areas_ = thread_areas_;
+  // When cloning a task in the same session, the new task's thread-locals
+  // are not initialized ... unless CLONE_SET_TLS is set.
+  if (other_session) {
+    t->thread_locals_initialized = thread_locals_initialized;
+  }
   if (CLONE_SET_TLS & flags) {
     set_thread_area_from_clone(t, tls);
+    t->thread_locals_initialized = true;
   }
 
   t->as->insert_task(t);
@@ -1534,13 +1565,13 @@ Task::CapturedState Task::capture_state() {
     memcpy(state.syscallbuf_hdr.data(), syscallbuf_hdr,
            state.syscallbuf_hdr.size());
   }
-  state.syscallbuf_fds_disabled_child = syscallbuf_fds_disabled_child;
-  state.mprotect_records = mprotect_records;
+  state.preload_globals = preload_globals;
   state.scratch_ptr = scratch_ptr;
   state.scratch_size = scratch_size;
   state.wait_status = wait_status;
   state.ticks = ticks;
   state.top_of_stack = top_of_stack;
+  state.thread_locals_initialized = thread_locals_initialized;
   return state;
 }
 
@@ -1588,8 +1619,7 @@ void Task::copy_state(const CapturedState& state) {
              state.syscallbuf_hdr.size());
     }
   }
-  syscallbuf_fds_disabled_child = state.syscallbuf_fds_disabled_child;
-  mprotect_records = state.mprotect_records;
+  preload_globals = state.preload_globals;
   // The scratch buffer (for now) is merely a private mapping in
   // the remote task.  The CoW copy made by fork()'ing the
   // address space has the semantics we want.  It's not used in
@@ -1602,6 +1632,8 @@ void Task::copy_state(const CapturedState& state) {
   wait_status = state.wait_status;
 
   ticks = state.ticks;
+
+  thread_locals_initialized = state.thread_locals_initialized;
 }
 
 void Task::destroy_local_buffers() {
@@ -2016,17 +2048,12 @@ template <typename Arch> static void do_preload_init_arch(Task* t) {
   auto params = t->read_mem(
       remote_ptr<rrcall_init_preload_params<Arch> >(t->regs().arg1()));
 
-  remote_ptr<volatile char> syscallbuf_fds_disabled =
-      params.syscallbuf_fds_disabled.rptr();
-  t->syscallbuf_fds_disabled_child = syscallbuf_fds_disabled.cast<char>();
-  t->mprotect_records = params.mprotect_records;
+  t->preload_globals = params.globals.rptr();
 
   t->stopping_breakpoint_table = params.breakpoint_table.rptr().as_int();
   t->stopping_breakpoint_table_entry_size = params.breakpoint_table_entry_size;
 
-  t->in_replay_flag = params.in_replay_flag.rptr();
-
-  t->write_mem(params.in_replay_flag.rptr(),
+  t->write_mem(REMOTE_PTR_FIELD(t->preload_globals, in_replay),
                (unsigned char)t->session().is_replaying());
 }
 

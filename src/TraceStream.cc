@@ -31,7 +31,7 @@ namespace rr {
 // MUST increment this version number.  Otherwise users' old traces
 // will become unreplayable and they won't know why.
 //
-#define TRACE_VERSION 52
+#define TRACE_VERSION 53
 
 struct SubstreamData {
   const char* name;
@@ -397,7 +397,8 @@ TraceWriter::RecordInTrace TraceWriter::write_mapped_region(
                                              : DONT_RECORD_IN_TRACE;
 }
 
-KernelMapping TraceReader::read_mapped_region(MappedData* data, bool* found) {
+KernelMapping TraceReader::read_mapped_region(MappedData* data, bool* found,
+                                              ValidateSourceFile validate) {
   if (found) {
     *found = false;
   }
@@ -435,7 +436,7 @@ KernelMapping TraceReader::read_mapped_region(MappedData* data, bool* found) {
     if (backing_file_name[0] != '/') {
       backing_file_name = dir() + "/" + backing_file_name;
     }
-    if (!is_clone) {
+    if (!is_clone && validate == VALIDATE) {
       struct stat backing_stat;
       if (stat(backing_file_name.c_str(), &backing_stat)) {
         FATAL() << "Failed to stat " << backing_file_name

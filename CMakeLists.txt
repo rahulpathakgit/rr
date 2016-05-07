@@ -443,6 +443,7 @@ set(BASIC_TESTS
   mremap_shrink
   msg
   msync
+  mtio
   multiple_pending_signals
   multiple_pending_signals_sequential
   munmap_segv
@@ -476,6 +477,7 @@ set(BASIC_TESTS
   ptrace_exec
   ptrace_exec32
   ptrace_seize
+  ptrace_sigchld_blocked
   ptrace_signals
   ptrace_syscall
   ptrace_syscall_clone_untraced

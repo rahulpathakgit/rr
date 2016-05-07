@@ -3099,7 +3099,8 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
         case Q_SYNC:
           break;
         default:
-          syscall_state.expect_errno = EINVAL;
+          // Don't set expect_errno here because quotactl can fail with
+          // various error codes before checking the command
           break;
       }
       return PREVENT_SWITCH;
@@ -3619,10 +3620,6 @@ static string extra_expected_errno_info(RecordTask* t,
              << " addr:" << HEX(t->regs().arg3());
           break;
         }
-        case Arch::quotactl:
-          ss << "; unknown quotactl(" << HEX(t->regs().arg1() >> SUBCMDSHIFT)
-             << ")";
-          break;
         case Arch::fcntl:
         case Arch::fcntl64:
           ss << "; unknown fcntl(" << HEX((int)t->regs().arg2_signed()) << ")";
@@ -3759,6 +3756,12 @@ static void rec_process_syscall_arch(RecordTask* t,
   }
 
   if (syscall_state.expect_errno) {
+    if (syscall_state.expect_errno == EINVAL && syscallno == Arch::ioctl &&
+        t->regs().syscall_result_signed() == -ENOTTY) {
+      // Unsupported ioctl was called, but is not supported for this device,
+      // so we can safely ignore it.
+      return;
+    }
     ASSERT(t, t->regs().syscall_result_signed() == -syscall_state.expect_errno)
         << "Expected " << errno_name(syscall_state.expect_errno) << " for '"
         << t->syscall_name(syscallno) << "' but got result "
@@ -4096,6 +4099,28 @@ static void rec_process_syscall_arch(RecordTask* t,
       }
       break;
     }
+
+    case Arch::quotactl:
+      switch (t->regs().arg1() >> SUBCMDSHIFT) {
+        case Q_GETQUOTA:
+        case Q_GETINFO:
+        case Q_GETFMT:
+        case Q_SETQUOTA:
+        case Q_QUOTAON:
+        case Q_QUOTAOFF:
+        case Q_SETINFO:
+        case Q_SYNC:
+          break;
+        default: {
+          auto ret = t->regs().syscall_result_signed();
+          ASSERT(t, ret == -ENOENT || ret == -ENODEV || ret == -ENOTBLK ||
+                        ret == -EINVAL)
+              << " unknown quotactl(" << HEX(t->regs().arg1() >> SUBCMDSHIFT)
+              << ")";
+          break;
+        }
+      }
+      break;
 
     case Arch::seccomp: {
       // Restore arg1 in case we modified it to disable the syscall
